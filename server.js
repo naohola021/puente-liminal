@@ -9,6 +9,16 @@
 // Dos salas: "mascara" y "cometa". Cada una tiene:
 //   - "device"  → el ESP32/Wemos físico en la galería
 //   - "viewer"  → cada navegador que visita la página web
+//
+// ── CAMBIO DE ESTA VERSIÓN ──────────────────────────────────
+// Para "cometa": antes cada mensaje {"type":"sonido"} de un viewer se
+// reenviaba tal cual, uno por uno, sin que el ESP32 supiera cuánta
+// gente estaba interactuando al mismo tiempo. Ahora el puente lleva la
+// cuenta de qué viewers mandaron sonido recientemente (últimos 900ms)
+// y le manda al device un solo mensaje agregado:
+//   {"type":"sonido", "nivel": <el más alto entre los activos>, "usuarios": <cuántos activos>}
+// Así el ESP32 puede hacer que la vibración sea más fuerte cuanto más
+// volumen Y cuanta más gente esté mandando sonido a la vez.
 // ─────────────────────────────────────────────────────────────
 
 const http = require('http');
@@ -32,10 +42,20 @@ const salas = {
     nitidezPermanente: 0,
     puestaAnterior: false,
   },
-  cometa: { devices: new Set(), viewers: new Set() },
+  cometa: {
+    devices: new Set(),
+    viewers: new Set(),
+    // ws del viewer → { nivel, ultimo (timestamp del último "sonido" que mandó) }
+    sonidoActivos: new Map(),
+  },
 };
 
 const PASO_NITIDEZ_PERMANENTE = 0.04;
+
+// Cuánto tiempo (ms) sigue "contando" un viewer como activo después de
+// su último mensaje de sonido. Si no manda nada en ese lapso, deja de
+// sumar a la cuenta de "usuarios".
+const VENTANA_SONIDO_MS = 900;
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -59,7 +79,6 @@ wss.on('connection', (ws, req) => {
   log(`+ ${rol} conectado a "${obra}" — devices:${sala.devices.size} viewers:${sala.viewers.size}`);
 
   if (rol === 'viewer') {
-    // Avisale a todos los devices que un viewer nuevo llegó.
     for (const d of sala.devices) {
       if (d.readyState === WebSocket.OPEN) d.send(JSON.stringify({ type: 'conexion' }));
     }
@@ -73,11 +92,6 @@ wss.on('connection', (ws, req) => {
     }
   }
 
-  // ── FIX: si un DEVICE se conecta y ya había viewers activos,
-  // avisale de una — antes esto solo pasaba al revés (viewer avisa a
-  // devices), así que si el ESP32 se prendía o reiniciaba DESPUÉS de
-  // que alguien ya tenía la web abierta, nunca se enteraba de que
-  // había alguien mirando y se quedaba sin mandar datos para siempre.
   if (rol === 'device' && sala.viewers.size > 0) {
     ws.send(JSON.stringify({ type: 'conexion' }));
     log(`  → aviso retroactivo: ya había ${sala.viewers.size} viewer(s) esperando en "${obra}"`);
@@ -102,6 +116,38 @@ wss.on('connection', (ws, req) => {
       } catch (e) {}
     }
 
+    if (obra === 'cometa' && rol === 'viewer') {
+      try {
+        const contenido = JSON.parse(mensajeSalida);
+        if (contenido.type === 'sonido') {
+          const nivel = typeof contenido.nivel === 'number'
+            ? Math.max(0, Math.min(1, contenido.nivel))
+            : 0.4;
+
+          sala.sonidoActivos.set(ws, { nivel, ultimo: Date.now() });
+
+          // Descarta a los que ya no mandaron sonido en la ventana —
+          // así "usuarios" refleja gente activa AHORA, no todo el
+          // historial de gente que alguna vez pasó por la web.
+          const ahora = Date.now();
+          for (const [cliente, info] of sala.sonidoActivos) {
+            if (ahora - info.ultimo > VENTANA_SONIDO_MS) sala.sonidoActivos.delete(cliente);
+          }
+
+          let nivelMax = 0;
+          for (const info of sala.sonidoActivos.values()) {
+            nivelMax = Math.max(nivelMax, info.nivel);
+          }
+
+          mensajeSalida = JSON.stringify({
+            type: 'sonido',
+            nivel: nivelMax,
+            usuarios: sala.sonidoActivos.size,
+          });
+        }
+      } catch (e) {}
+    }
+
     for (const cliente of otroGrupo) {
       if (cliente.readyState === WebSocket.OPEN) cliente.send(mensajeSalida);
     }
@@ -109,6 +155,9 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     propioGrupo.delete(ws);
+    if (obra === 'cometa' && rol === 'viewer') {
+      sala.sonidoActivos.delete(ws);
+    }
     log(`- ${rol} desconectado de "${obra}" — devices:${sala.devices.size} viewers:${sala.viewers.size}`);
     if (rol === 'viewer') {
       for (const d of sala.devices) {
