@@ -1,15 +1,12 @@
 {
   "name": "puente-liminal",
   "version": "1.0.0",
-  "description": "Servidor puente entre dispositivos físicos y visitantes web para el proyecto LIMINAL",
+  "description": "Puente WebSocket para la instalación LIMINAL (máscara + cometa)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "ws": "^8.16.0"
-  },
-  "engines": {
-    "node": "18.x"
   }
 }
